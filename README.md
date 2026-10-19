@@ -1,23 +1,26 @@
-# Per-task LightGBM on shared PCA vs shared-hidden-layer MLP for related digit tasks
+Digits multi-task comparison: shared MLP baseline vs per-task class-balanced LightGBM.
 
-This experiment is motivated by "Distribution matching for multi-task learning of classification tasks: a large-scale study on faces & beyond" (AAAI, 2024), which studies how well multi-task classifiers handle several related classification tasks at once. A common baseline for such settings is hard parameter sharing, where one shared hidden layer feeds all task outputs. This repository tests a simpler alternative on a small, fully reproducible problem.
+Setup
+- Data: scikit-learn bundled digits (load_digits), no download.
+- Tasks: is_even, is_gt_4, is_prime derived from the digit label.
+- One stratified 70/30 split (seed 42); the test set is used only for the final scores.
+- Seeds 42, 43, 44. Hyper-parameters chosen by 5-fold stratified CV on the training split only.
 
-**Question:** Does a per-task class-balanced LightGBM on a shared PCA representation beat a standard shared-hidden-layer MLP on every related classification task, not just on average?
+Models
+- Baseline: sklearn MLPClassifier, one shared hidden layer, on standardised pixels (unchanged).
+- Improved: per-task LightGBM (class_weight="balanced") on standardised pixels plus 30 PCA components
+  (PCA fit on training pixels). LightGBM grid: num_leaves, learning_rate, n_estimators, colsample_bytree.
 
-**Dataset:** scikit-learn's bundled digits dataset (`load_digits`), with three binary tasks derived from the digit label: is-even, is-greater-than-4, and is-prime. This is not the paper's own dataset. A single stratified 70/30 split with a fixed seed is used.
+Run
+    pip install -r requirements.txt
+    python analysis.py
 
-**Baseline:** a standard hard-parameter-sharing MLP with one shared hidden layer and sigmoid multi-label outputs (scikit-learn `MLPClassifier`), trained on standardised pixels.
+Outputs: results.json and figures/per_task_macro_f1.png.
 
-**Improved model:** a shared PCA representation fit on training pixels, with one class-balanced LightGBM per task. Hyper-parameters are chosen by cross-validation on the training set only.
-
-**How to run**
-
-```
-pip install -r requirements.txt
-python analysis.py
-```
-
-**Results:** results are written to `results.json`, and a per-task chart is saved to `figures/`.
+Caveats
+- One train/test split; seed variation only. The test set is small, so per-task gaps of a few points may be noise.
+- The improved model was changed after a run in which it trailed the baseline; the new version has not been
+  verified by a successful CI run in this submission.
 
 ## Reference
 

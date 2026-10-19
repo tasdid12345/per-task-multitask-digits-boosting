@@ -1,6 +1,7 @@
 """Baseline: shared-hidden-layer MLP (sklearn MLPClassifier, sigmoid multi-label outputs).
-Improved: shared PCA representation + one class-balanced, CV-tuned LightGBM per task.
-Tasks are derived from scikit-learn's bundled digits data. The test set is used once, at the end."""
+Improved: per-task class-balanced LightGBM on richer features (standardised pixels + PCA components),
+with a wider train-only CV grid that includes feature subsampling. The test set is used once, at the end.
+Tasks are derived from scikit-learn's bundled digits data."""
 import itertools
 import json
 import os
@@ -25,8 +26,8 @@ N_PCA = 30            # fixed, not tuned on test
 TASKS = ["is_even", "is_gt_4", "is_prime"]
 SOURCE = "https://scikit-learn.org/stable/datasets/toy_dataset.html"
 MLP_GRID = [dict(hidden_layer_sizes=(h,), alpha=a) for h, a in itertools.product([64, 128], [1e-4, 1e-2])]
-LGB_GRID = [dict(num_leaves=nl, learning_rate=lr, n_estimators=ne)
-            for nl, lr, ne in itertools.product([7, 15], [0.05, 0.1], [100, 300])]
+LGB_GRID = [dict(num_leaves=nl, learning_rate=lr, n_estimators=ne, colsample_bytree=cs)
+            for nl, lr, ne, cs in itertools.product([7, 15, 31], [0.05, 0.1], [200, 400], [0.3, 0.7])]
 
 
 def macro_f1_per_task(y_true, y_pred):
@@ -50,11 +51,12 @@ def mlp_fit_predict(params, seed):
 
 
 def lgb_fit_predict(params, seed):
-    """Separate class-balanced LightGBM per task on the shared PCA features."""
+    """Separate class-balanced LightGBM per task on the shared feature matrix."""
     def fp(Xa, Ya, Xb):
         out = np.zeros((len(Xb), Ya.shape[1]), dtype=int)
         for t in range(Ya.shape[1]):
-            m = lgb.LGBMClassifier(class_weight="balanced", random_state=seed, n_jobs=1, verbose=-1, **params)
+            m = lgb.LGBMClassifier(class_weight="balanced", random_state=seed, n_jobs=1, verbose=-1,
+                                   **params)
             out[:, t] = m.fit(Xa, Ya[:, t]).predict(Xb)
         return out
     return fp
@@ -69,29 +71,31 @@ def main():
     # One stratified 70/30 split (stratified on the digit label), fixed seed
     Xtr, Xte, Ytr, Yte, dtr, _ = train_test_split(X, Y, digit, test_size=0.3, stratify=digit, random_state=SEED)
 
-    # Standardise pixels and fit the shared PCA on training data only
+    # Standardise pixels and fit the PCA on training data only
     scaler = StandardScaler().fit(Xtr)
     Ztr, Zte = scaler.transform(Xtr), scaler.transform(Xte)
     pca = PCA(n_components=N_PCA, random_state=SEED).fit(Ztr)
     Ptr, Pte = pca.transform(Ztr), pca.transform(Zte)
+    # Improved features: standardised pixels + PCA components (both fit on training data only)
+    Ftr, Fte = np.hstack([Ztr, Ptr]), np.hstack([Zte, Pte])
     print(f"Train {len(Xtr)} / test {len(Xte)}; PCA explains {pca.explained_variance_ratio_.sum():.3f} variance")
 
     base_runs, impr_runs = [], []
     for seed in SEEDS:
-        # ---- Baseline: shared MLP; hidden size / alpha chosen by train-only CV ----
+        # ---- Baseline: shared MLP; hidden size / alpha chosen by train-only CV (unchanged) ----
         cv = [cv_task_scores(mlp_fit_predict(p, seed), Ztr, Ytr, dtr, seed).mean() for p in MLP_GRID]
         best = MLP_GRID[int(np.argmax(cv))]
         pred = mlp_fit_predict(best, seed)(Ztr, Ytr, Zte)
         base_runs.append(macro_f1_per_task(Yte, pred))
         print(f"seed {seed} baseline: best={best} test F1 per task={np.round(base_runs[-1], 4)}")
 
-        # ---- Improved: shared PCA + per-task balanced LightGBM; per-task params chosen by train-only CV ----
-        cv = np.array([cv_task_scores(lgb_fit_predict(p, seed), Ptr, Ytr, dtr, seed) for p in LGB_GRID])
+        # ---- Improved: per-task balanced LightGBM on pixels + PCA; per-task params chosen by train-only CV ----
+        cv = np.array([cv_task_scores(lgb_fit_predict(p, seed), Ftr, Ytr, dtr, seed) for p in LGB_GRID])
         pred, chosen = np.zeros_like(Yte), []
         for t in range(len(TASKS)):
             p = LGB_GRID[int(np.argmax(cv[:, t]))]
             chosen.append(p)
-            pred[:, t] = lgb_fit_predict(p, seed)(Ptr, Ytr[:, [t]], Pte)[:, 0]
+            pred[:, t] = lgb_fit_predict(p, seed)(Ftr, Ytr[:, [t]], Fte)[:, 0]
         impr_runs.append(macro_f1_per_task(Yte, pred))
         print(f"seed {seed} improved: best={chosen} test F1 per task={np.round(impr_runs[-1], 4)}")
 
@@ -109,7 +113,7 @@ def main():
     x, w = np.arange(len(TASKS)), 0.38
     plt.figure(figsize=(7, 4))
     plt.bar(x - w / 2, b_task, w, label="baseline: shared MLP")
-    plt.bar(x + w / 2, i_task, w, label="improved: PCA + balanced LightGBM")
+    plt.bar(x + w / 2, i_task, w, label="improved: pixels+PCA balanced LightGBM")
     plt.xticks(x, TASKS)
     plt.ylabel("test macro-F1 (mean over seeds)")
     plt.ylim(max(0.0, min(b_task.min(), i_task.min()) - 0.05), 1.0)
@@ -123,9 +127,9 @@ def main():
                     "shared-hidden-layer MLP on every related classification task, not just on average, "
                     "using scikit-learn's digits data?",
         "method": "Derive three binary tasks (is-even, is-greater-than-4, is-prime) from the digit label. "
-                  "One stratified 70/30 split. Compare a shared-hidden-layer MLP with a shared PCA + per-task "
-                  "class-balanced LightGBM. Hyper-parameters chosen by 5-fold CV on train only; test used once. "
-                  "Seeds 42, 43, 44.",
+                  "One stratified 70/30 split. Compare a shared-hidden-layer MLP with per-task class-balanced "
+                  "LightGBM on standardised pixels plus PCA components. Hyper-parameters chosen by 5-fold CV on "
+                  "train only; test used once. Seeds 42, 43, 44.",
         "dataset": {
             "name": "scikit-learn digits (load_digits)",
             "source_url": SOURCE,
@@ -139,9 +143,9 @@ def main():
         "higher_is_better": True,
         "baseline": "Standard hard-parameter-sharing MLP: one shared hidden layer, sigmoid multi-label outputs "
                     "(sklearn MLPClassifier) on standardised pixels; hidden size and alpha chosen by train-only CV.",
-        "improved": "Shared PCA representation (30 components fit on training pixels) with a separate "
-                    "class-balanced LightGBM per task; num_leaves, learning_rate and n_estimators chosen per task "
-                    "by train-only CV.",
+        "improved": "Per-task class-balanced LightGBM on standardised pixels concatenated with 30 PCA components "
+                    "(fit on training pixels); num_leaves, learning_rate, n_estimators and colsample_bytree "
+                    "chosen per task by train-only 5-fold CV over a 24-configuration grid.",
         "metrics": {
             "baseline_score": b_score,
             "improved_score": i_score,
@@ -159,9 +163,10 @@ def main():
                  "model randomness only. The three tasks are deterministic functions of one label and therefore "
                  "strongly related; the test set is small, so per-task gaps of a few points may be noise. "
                  "Both models get the same 5-fold CV folds per seed; the baseline grid has 4 configurations and "
-                 "the LightGBM grid has 8 per task. PCA dimension is fixed, not tuned. The paper's architecture is "
-                 "not specified in the provided abstract, so this is not a replication of its method. "
-                 "load_digits is bundled, so no network download or retry logic is needed.",
+                 "the LightGBM grid has 24 per task. The LightGBM model receives the same standardised pixels "
+                 "the baseline uses, plus PCA components. PCA dimension is fixed, not tuned. The paper's "
+                 "architecture is not specified in the provided abstract, so this is not a replication of its "
+                 "method. load_digits is bundled, so no network download or retry logic is needed.",
     }
     with open("results.json", "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
